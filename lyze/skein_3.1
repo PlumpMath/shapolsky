@@ -1,0 +1,862 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+"""
+############################
+############################
+THIS TRANSFORMS ACRIS DATA INTO NETWORKX DATA
+############################
+############################
+"""
+
+import csv
+import codecs
+import sys
+import cStringIO
+from dateutil.parser import parse
+from collections import defaultdict
+import re
+import time
+import calendar  
+import logging
+import json
+import operator
+import itertools
+import networkx as nx
+import math
+from networkx.readwrite import json_graph
+from networkx.algorithms import small_world
+import os
+import argparse
+import skein_settings
+import skein_secret
+import skein
+import numpy
+import scipy.stats
+import datetime
+import matplotlib
+matplotlib.use('Agg')	 # has to be called before below two imports
+import matplotlib.pyplot as plt
+import matplotlib.dates as md
+import base64
+import hashlib
+
+import community
+
+#import small_world_factor
+
+
+reload(sys)
+sys.setdefaultencoding('utf-8')
+csvdir = "../" + skein_settings.CSVDIR
+jsondir = "../" + skein_settings.JSONDIR
+
+ 
+def initVars(filepath):
+	global searchTerm, searchTermEng 
+	filename = os.path.basename(filepath)
+	(searchTerm, searchTermEng) = skein.parseTermsFromCSV(filename)
+
+
+def is_number(s):
+	try:
+		float(s)
+		return True
+	except ValueError:
+		return False
+
+def generateAccountCategoryDict(manualFilepath):
+#return accountDict = 
+	accountDictByID = {}
+
+	with open(manualFilepath, 'rb') as fin:
+		reader = skein.UnicodeReader(fin)
+		for line in reader: 
+			#Screen Name,Weibo ID,Category
+			if(is_number(line[2])):
+				accountDictByID[line[1]] = {'screenName': line[0], 'category': line[2], 'categoryText': skein_settings.accountCode[line[2]]}
+	return accountDictByID;
+
+def genderToText(gendercode):
+	genderDict = {
+		"m": "Individual (male)",
+		"f": "Individual (female)",
+	}
+	if gendercode in genderDict:
+		return genderDict[gendercode]
+	else:
+		return "Unknown"
+
+
+def csvInputToAdjacencyHistory(csvFilepathSrc, accountDict):
+	# mostly, we're adding the edges.
+
+	# adj history looks like this
+	# edges/posts: [{ source: ..., target: ..., text: ..., weight: 1, timestamp: 13.... }, ...]
+	# each post is a node!
+
+	# nodes look like this
+	# nodes/users: [{ nodeid: ..., weibouser: {"....", ..}, stats: {"...", ..}} ]
+
+	def getSortedPostsFromFile(filepath):
+		with open(filepath, 'rb') as fin:
+			reader = skein.UnicodeReader(fin)
+			csvPosts = []
+			for line in reader:
+				csvPosts.append(line)
+		parsedPosts = filter(lambda x: x != None, map(skein.parseWeiboFull, csvPosts))
+		sortedPosts = sorted(parsedPosts, key = lambda d: d["weibo.created_at.timestamp"])
+		return sortedPosts
+
+	def truncateBadApiPosts(posts):
+		return filter(lambda d: d["weibo.created_at.timestamp"] < skein_settings.BAD_API_START_TIMESTAMP, posts)
+
+	def postToEdgeDict(post, accountDict):
+		desiredKeys = ["user.id", "user.screenName", "weibo.id", "weibo.created_at.timestamp", "weibo.text", "user.province", "user.gender", "user.category", "user.categoryText"]
+		edgeDict = {k:v for k,v in post.iteritems() if k in desiredKeys}
+		if(post["user.id"] in accountDict and str(accountDict[post["user.id"]]['category']) != '4'):
+			edgeDict['user.category'] = accountDict[post["user.id"]]['category']
+			edgeDict['user.categoryText'] = accountDict[post["user.id"]]['categoryText']
+		else:
+			edgeDict['user.category'] = post["user.gender"]
+			edgeDict['user.categoryText'] = genderToText(post["user.gender"]) 
+#		print edgeDict['user.categoryText']
+		return edgeDict
+
+	sortedPosts = truncateBadApiPosts(getSortedPostsFromFile(csvFilepathSrc))
+
+	# creating list of mentions and reposts
+	repostScreennamesPerPost = map(lambda x:  x["weibo.text.repostsonly"], sortedPosts)
+	mentionScreennamesPerPost = map(lambda x:  x["weibo.text.mentionsonly"], sortedPosts)
+
+	# turning screennames into obfuscated ids
+	ourPostersScreennames = list(post['user.screenName'] for post in sortedPosts)
+	allScreennames = set(list(itertools.chain.from_iterable(repostScreennamesPerPost + mentionScreennamesPerPost)) + ourPostersScreennames)
+	allScreennamesToObfIDs = dict(zip(allScreennames, range(len(allScreennames))))
+
+	# creating list of all mentions, reposts
+	postToEdgeDicts = map(lambda x: postToEdgeDict(x, accountDict), sortedPosts)
+
+	mentionEdges = []	
+	for post in filter(lambda x: x["weibo.text.mentionsonly"] != [], sortedPosts):
+		thisEdgeDict = postToEdgeDict(post, accountDict)
+		for eachMention in post["weibo.text.mentionsonly"]:
+			thisMention = thisEdgeDict.copy() 
+			thisMention.update({"user.obfID": allScreennamesToObfIDs[thisMention["user.screenName"]]})
+			thisMention.update({"target.screenName": eachMention})
+			thisMention.update({"target.obfID": allScreennamesToObfIDs[eachMention]})
+			thisMention.update({"target.type": "mention"})
+			thisMention.update({"weight": 1})
+			mentionEdges.append(thisMention)
+
+	repostEdges = []	
+	for repostTuple in filter(lambda x: x != [], zip(postToEdgeDicts, repostScreennamesPerPost)):
+		for eachRepost in repostTuple[1]:
+			thisRepost = {}
+			thisRepost.update(repostTuple[0])
+			thisRepost.update({"user.obfID": allScreennamesToObfIDs[thisRepost["user.screenName"]]})
+			thisRepost.update({"target.screenName": eachRepost})
+			thisRepost.update({"target.obfID": allScreennamesToObfIDs[eachMention]})
+			thisRepost.update({"target.type": "repost"})
+			thisRepost.update({"weight": 1})
+			repostEdges.append(thisRepost)
+
+	# creating list of all edges, sorted by time
+	adjHistory = sorted(mentionEdges + repostEdges, key = lambda d: d["weibo.created_at.timestamp"])
+
+		
+	# go through and pre-calculate the weight so far for this link
+	edgeWeightCounter = defaultdict(int)
+	for adj in adjHistory:
+		edgeNotation = stringify([adj["user.obfID"] , "-" , adj["target.obfID"]])
+		edgeWeightCounter[edgeNotation] += adj["weight"]
+		adj["weightSoFar"] = edgeWeightCounter[edgeNotation]
+
+
+	#go through and mark posts as last post or not	
+	tempEdgeDict = defaultdict(int)
+	# since adjhistory is sorted, let's go backwards and find the first connection between two nodes (aka the last in time)
+	for adj in reversed(adjHistory):
+		edgeNotation = stringify([adj["user.obfID"] , "-" , adj["target.obfID"]])
+		if(tempEdgeDict[edgeNotation] == 0):
+			adj["isLastPost"] = "true"
+		else:
+			adj["isLastPost"] = "false"
+		tempEdgeDict[edgeNotation] += 1
+
+	return (adjHistory, sortedPosts, allScreennamesToObfIDs)
+
+
+
+def writeAdjHistory(adjHistory, adjHistoryFilepathDest):
+	with open(adjHistoryFilepathDest, 'w') as f:
+		json.dump(adjHistory, f, indent=4, separators=(',', ': '))
+
+
+def returnObfuscatedPost(post, is_compressed=False):
+	obfusDict = {k:v for k,v in post.iteritems() if k in skein_settings.desiredObfPostMaps.keys()}
+	if(is_compressed):
+		obfusDict = {skein_settings.desiredObfPostMaps[k]:v for k,v in obfusDict.iteritems()}
+	return obfusDict
+
+
+def returnObfuscatedPerson(node, is_compressed=False):
+	obfusDict = {k:v for k,v in node.iteritems() if k in skein_settings.desiredObfPersonMaps.keys()}
+	if(is_compressed):
+		obfusDict = {skein_settings.desiredObfPersonMaps[k]:v for k,v in obfusDict.iteritems()}
+	return obfusDict
+
+
+def writeObfuscatedAdjHistory(adjHistory, obfuscatedAdjHistoryFilepathDest):
+
+	obfuscatedAdjHistory = [returnObfuscatedPost(adj) for adj in adjHistory]
+
+	with open(obfuscatedAdjHistoryFilepathDest, 'w') as f:
+		json.dump(obfuscatedAdjHistory, f, indent=4, separators=(',', ': '))
+
+def adjToKey(adj, length=10):
+	prefix = stringify([adj["user.obfID"] , "-to-" , adj["target.obfID"], "--", adj["weibo.created_at.timestamp"], "-", adj["target.type"]])
+	weiboid = stringify(["-", adj["weibo.id"]]) 
+	hasher = hashlib.sha1(str(prefix + weiboid) + skein_secret.weiboIDSalt)
+	return prefix + "-" + base64.urlsafe_b64encode(hasher.digest())[0:length]
+
+
+def generateNetworkXGraph(adjHistory, sortedPosts, screenNameObfIndex, accountDict):
+
+	#initialize directed graph w/ parallel edges
+	G = nx.MultiDiGraph()
+
+	#ADD EDGES
+	for adj in adjHistory:
+		#generate unique edge key
+		edgeKey = adjToKey(adj)
+		source = screenNameObfIndex[adj["user.screenName"]] # source
+		target = screenNameObfIndex[adj["target.screenName"]] # target 
+		G.add_edge(source,
+				target,
+				edgeKey, #key
+				adj) # more data
+
+		G.node[source]['lastAdj'] = adj
+		G.node[source]['user.screenName'] = adj["user.screenName"]
+		G.node[target]['user.screenName'] = adj["target.screenName"]  # the target node's own screenname is target.screenname
+		G.node[source]['in_network'] = 'true' 
+
+
+	print "len(adjHistory)", len(adjHistory)
+	print "G.number_of_edges()", G.number_of_edges() 
+
+	#ADD PEOPLE WHO DIDNT MAKE ANY MENTIONS OR REPOSTS
+
+	# get total posts by screenname
+	postCountByScreenname = defaultdict(int)
+	for post in sortedPosts:
+		postCountByScreenname[post['user.screenName']] += 1
+
+	soloUserDict = {
+		"in_degree": 0,
+		"out_degree": 0,
+		"tot_degree": 0,
+		"allref_in_count": 0,
+		"allref_out_count": 0,
+		"mention_in_count": 0,
+		"mention_out_count": 0,
+		"repost_in_count": 0,
+		"repost_out_count": 0,
+		"mention_in_user_count": 0,
+		"mention_out_user_count": 0,
+		"repost_in_user_count": 0,
+		"repost_out_user_count": 0
+
+	}
+
+	postsWithoutReferences = filter(lambda x: len(x["weibo.text.mentionsonly"]) + len(x["weibo.text.repostsonly"]) == 0, sortedPosts)
+	numPostsWithReferences = len(filter(lambda x: len(x["weibo.text.mentionsonly"]) + len(x["weibo.text.repostsonly"]) > 0, sortedPosts))
+	numPostsWithMentions = len(filter(lambda x: len(x["weibo.text.mentionsonly"]) > 0, sortedPosts))
+	numPostsWithReposts = len(filter(lambda x: len(x["weibo.text.repostsonly"]) > 0, sortedPosts))
+
+	
+	postersWithoutReferencesCount = defaultdict(int)
+	for post in postsWithoutReferences:
+		postersWithoutReferencesCount[post['user.screenName']] += 1
+
+	for posterScreenName, count in postersWithoutReferencesCount.iteritems():
+		thisdict = {}
+		thisdict.update(soloUserDict)
+		thisdict.update({"total_posts": count, "screenName": posterScreenName, "user.id":screenNameObfIndex[posterScreenName], "has_references": "false"})
+#		G.add_node(screenNameObfIndex[posterScreenName]) #, attr_dict=thisdict)
+
+	### ADD USER DATA TO NODES
+	for nid in nx.nodes_iter(G):
+		if 'lastAdj' in G.node[nid]:
+			G.node[nid]['user.province'] = G.node[nid]['lastAdj']['user.province']
+			G.node[nid]['user.gender'] = G.node[nid]['lastAdj']['user.gender']
+			G.node[nid]['user.screenName'] = G.node[nid]['lastAdj']['user.screenName']
+			G.node[nid]['user.id'] = G.node[nid]['lastAdj']['user.id']
+			G.node[nid]['user.obfID'] = G.node[nid]['lastAdj']['user.obfID']
+			del G.node[nid]['lastAdj']
+			
+	for nid in nx.nodes_iter(G):
+		if 'user.province' in G.node[nid]:
+			# this person is in-network
+
+			realUserID = G.node[nid]['user.id']
+			if(realUserID in accountDict and str(accountDict[realUserID]['category']) != '4'):
+				G.node[nid]['user.category'] = accountDict[realUserID]['category']
+				G.node[nid]['user.categoryText'] = accountDict[realUserID]['categoryText']
+			else:
+				G.node[nid]['user.category'] = G.node[nid]['user.gender']
+				G.node[nid]['user.categoryText'] = genderToText(G.node[nid]['user.gender']) 
+
+		else:
+			#this person is out-of-network
+			G.node[nid]['user.category'] = "-1"
+			G.node[nid]['user.categoryText'] = skein_settings.accountCode["-1"]
+
+	#ANALYZE NODES
+	IDC = nx.in_degree_centrality(G)
+	ODC = nx.out_degree_centrality(G)
+	DC = nx.degree_centrality(G)
+	try:
+		phi = (1+math.sqrt(len(G)))/2.0
+		KC = nx.katz_centrality_numpy(G, 1/phi-0.01, 1, 1000)
+		EC = nx.eigenvector_centrality(G)
+		BC = nx.betweenness_centrality(G)
+	except Exception, e:
+		print "warning: we were trying to do centralities: ", e
+
+	print "analyzed graph"
+
+	#ADD ANALYZED DATA TO NODES
+	for nid in nx.nodes_iter(G):
+#		print nid
+		try:
+			G.node[nid]["eigenvector_centrality"]=float(skein_settings.FLOATFORMAT.format(EC[nid]))
+			G.node[nid]["betweenness_centrality"]=float(skein_settings.FLOATFORMAT.format(BC[nid]))
+			G.node[nid]["katz_centrality"]=float(skein_settings.FLOATFORMAT.format(KC[nid]))
+		except Exception as e:
+			G.node[nid]["eigenvector_centrality"]=""
+			
+			
+
+		G.node[nid]["in_degree"]=float(skein_settings.FLOATFORMAT.format(IDC[nid]))
+		G.node[nid]["out_degree"]=float(skein_settings.FLOATFORMAT.format(ODC[nid]))
+		G.node[nid]["tot_degree"]=float(skein_settings.FLOATFORMAT.format(DC[nid]))
+		G.node[nid]["allref_in_count"]=len(G.in_edges(nid))
+		G.node[nid]["allref_out_count"]=len(G.out_edges(nid))
+		G.node[nid]["mention_in_count"]=len([u for (u,v,d) in G.in_edges(nid, data=True) if "target.type" in d and d["target.type"] == "mention"])
+		G.node[nid]["mention_out_count"]=len([u for (u,v,d) in G.out_edges(nid, data=True) if "target.type" in d and d["target.type"] == "mention"])
+		G.node[nid]["repost_in_count"]=len([u for (u,v,d) in G.in_edges(nid, data=True) if "target.type" in d and d["target.type"] == "repost"])
+		G.node[nid]["repost_out_count"]=len([u for (u,v,d) in G.out_edges(nid, data=True) if "target.type" in d and d["target.type"] == "repost"])
+		G.node[nid]["mention_in_user_count"]=len(set([u for (u,v,d) in G.in_edges(nid, data=True) if "target.type" in d and d["target.type"] == "mention"]))
+		G.node[nid]["mention_out_user_count"]=len(set([u for (u,v,d) in G.out_edges(nid, data=True) if "target.type" in d and d["target.type"] == "mention"]))
+		G.node[nid]["repost_in_user_count"]=len(set([u for (u,v,d) in G.in_edges(nid, data=True) if "target.type" in d and d["target.type"] == "repost"]))
+		G.node[nid]["repost_out_user_count"]=len(set([u for (u,v,d) in G.out_edges(nid, data=True) if "target.type" in d and d["target.type"] == "repost"]))
+#		thisScreenName = [screenName for screenName, obfID in screenNameObfIndex.iteritems() if obfID == nid][0]
+#		G.node[nid]["screenName"]= thisScreenName
+		if 'user.screenName' in G.node[nid]:
+			G.node[nid]["total_posts"] = postCountByScreenname[G.node[nid]['user.screenName']]
+		else:
+			G.node[nid]["total_posts"] = 0
+		G.node[nid]["user.obfID"] = nid
+		G.node[nid]["has_references"] = "true"
+		G.node[nid]["neighbors"] = G[nid]
+		G.node[nid]["neighborIDs"] = list(set(G.predecessors(nid) + G.successors(nid)))
+
+#	print G.in_degree()
+#	print scipy.stats.skew(G.in_degree().values())
+#	print G.out_degree()
+
+	fig = plt.figure()
+	inoutmap = defaultdict(int)
+	for nid in nx.nodes_iter(G):
+#		print G.node[nid]
+		in_network_predecessors = filter(lambda x: "in_network" in G.node[x], G.predecessors(nid))
+		in_network_successors = filter(lambda x: "in_network" in G.node[x], G.successors(nid))
+#		print nid , ":" , in_network_predecessors, "->", nid, "   ", nid, "->", in_network_successors
+		inoutmap[str(len(in_network_predecessors)) + "-" + str(len(in_network_successors))] += 1
+#		inoutmap[str(len(G.predecessors(nid))) + "-" + str(len(G.successors(nid)))] += 1
+		#atter(len(G.predecessors(nid)), len(G.successors(nid)), s=5, alpha=0.5)
+	
+	comm_bilateral_range = 33.33
+	pubNum = 0
+	bilateralNum = 0
+	unilateralNum = 0
+	for k, val in inoutmap.iteritems():
+		(n1, n2) = map(lambda x: int(x), k.split("-"))
+
+		if(n1 >= 2 or n2 >= 2):
+			if(n2 < math.tan(math.radians(45.0 - (comm_bilateral_range / 2))) * n1):
+				#these are public figures
+				color = "#0000ff"
+				pubNum += val
+				pass
+			elif(n2 <= math.tan(math.radians(45.0 + (comm_bilateral_range / 2))) * n1):
+				#these are bilaterals
+				color = "#00ff00"
+				bilateralNum += val
+				pass
+			else:
+				#these are unilaterals
+				color = "#ff0000"
+				unilateralNum += val
+				pass
+		else:
+			color = "#CCCCCC"
+		plt.scatter(n1, n2, s=val + 5, alpha=0.3, color=color)
+	plt.xlabel("predecessors / referenced by")
+	plt.ylabel("successors / people referenced; unil: %s, bil: %s, pub: %s" % (unilateralNum, bilateralNum, pubNum))
+	plt.title("searchTerm = %s ( %s)" % (searchTerm, searchTermEng))
+	plt.axis([-10, 100, -10, 100])
+	fig.savefig('/var/www/ubuntu.hrichina.org/public_html/inoutmaps/' + searchTermEng + '.png')
+	print "Saved figure"
+
+	G.graph['commtype_bilateral_range'] = comm_bilateral_range
+	G.graph['commtype_public_figure'] = pubNum
+	G.graph['commtype_bilateral'] = bilateralNum
+	G.graph['commtype_unilateral'] = unilateralNum
+		
+	# ANALYZE GRAPH
+	try:
+		G.graph['diameter'] = nx.diameter(G)
+	except:
+		pass
+	try:
+		G.graph['density'] = nx.density(G)
+	except:
+		pass
+	try:
+		G.graph['degree_histogram'] = json.dumps(nx.degree_histogram(G))
+	except:
+		pass
+
+	try:
+		# ADD OTHER DATA
+		G.graph["searchTerm"] = searchTerm
+		G.graph["searchTermEng"] = searchTermEng
+		G.graph["total_posts"] = len(sortedPosts)
+		G.graph["total_referencing_posts"] = numPostsWithReferences
+		G.graph["total_mentioning_posts"] = numPostsWithMentions
+		G.graph["total_reposting_posts"] = numPostsWithReposts
+
+		undG = toWeightedGraph(G)
+
+		partition = community.best_partition(undG)
+		"""
+		print "==== PARTITION ===="
+		print partition
+		print partition.values()
+		print "==== MODULARITY ===="
+		print set(partition.values())
+		print numpy.histogram(partition.values(), bins=xrange(max(partition.values())))
+		print community.modularity(partition, undG)
+		"""
+
+		G.graph["undG_partitions"] = partition.values()
+
+		G.graph["undG_average_clustering"] = nx.average_clustering(undG)
+		G.graph["undG_degree_histogram"] = nx.degree_histogram(undG)
+		G.graph["undG_degree_histogram_stddev"] = numpy.std(nx.degree_histogram(undG))
+		G.graph["undG_number_of_bilateral_connections"] = undG.number_of_edges() 
+
+		subgraphs = sorted([g for g in nx.connected_component_subgraphs(undG)], key = lambda g: g.number_of_nodes(), reverse=True)
+		subgraphSizes = [g.number_of_nodes() for g in subgraphs]
+		
+		G.graph["undG_subgraph_sizes"] = subgraphSizes
+		G.graph["undG_subgraph_percentages"] = map(lambda x: float(skein_settings.FLOATFORMAT.format(float(x) / sum(subgraphSizes)), subgraphSizes))
+		G.graph["undG_subgraph_densities"] = map(lambda x: float(skein_settings.FLOATFORMAT.format(nx.density(x)), subgraphs))
+
+		G.graph["undG_subgraph_sizes"] = subgraphSizes
+		G.graph["undG_subgraph_sizes_variance"] = numpy.var(subgraphSizes)
+		G.graph["undG_subgraph_sizes_stddev"] = numpy.std(subgraphSizes)
+		G.graph["undG_subgraph_sizes_mean"] = numpy.mean(subgraphSizes)
+		G.graph["undG_transitivity"] = nx.algorithms.transitivity(undG)
+
+		#print "small_world_factor"
+		#G.graph["undG_small_world_factor"] = small_world_factor.swi_er(undG)
+		#print "small_world_factor end"
+
+
+		print subgraphSizes
+		print numpy.mean(subgraphSizes), math.sqrt(numpy.std(subgraphSizes))
+
+		print "ANALYSIS done"
+		"""
+		# TRYING TO CALCULATE DEGREE OF SMALL-WORLD NESS
+		try:
+			for g in nx.connected_component_subgraphs(undG):
+				print(nx.average_shortest_path_length(g)) 
+		except Exception, e:
+			print e
+
+
+		print nx.number_of_nodes(undG)
+		averageEdgePerNode = nx.density(undG)
+		print averageEdgePerNode
+
+		for i in xrange(0):
+
+			print "create graph"
+			rndG = nx.erdos_renyi_graph(nx.number_of_nodes(undG), averageEdgePerNode)
+
+			print "calc clustering"
+			rndGClustering = nx.average_clustering(rndG)
+
+			print "calc aspl"
+			rndGaspl = nx.average_shortest_path_length(rndG)
+
+			print G.graph["average_clustering"], " vs. ", rndGClustering
+			upsilonG = G.graph["average_clustering"] / rndGClustering
+			lambdaG = G.graph["undG_average_shortest_path_length"] / rndGaspl
+			print "upsilonG", upsilonG
+			print "print lambdaG", lambdaG
+		"""	
+
+	except Exception, e:
+		print e
+
+	return G
+
+
+
+
+def cullNetworkXGraph(G):
+	try:
+		nodesByPosts = sorted(G.nodes(data=True), key = lambda n: n[1]['total_posts'], reverse=True)
+
+		# get the nodes we want to save
+		savedNodeIdsByPosts = map(lambda n: n[0], nodesByPosts[:skein_settings.cullN])
+
+		# get their neighbors so we're not just looking at prolific people talking to prolific people
+		neighborsOfSavedNodes = list(set(reduce(lambda acc, n: acc + G.neighbors(n), savedNodeIdsByPosts, [])))
+
+		nodesToSave = list(set(neighborsOfSavedNodes + savedNodeIdsByPosts))
+
+		# now cull a graph so that we only have both
+	#	culledG = nx.Graph(G.subgraph(savedNodeIdsByPosts))
+		culledG = nx.Graph(G.subgraph(nodesToSave))
+
+
+		culledPercentage = 1.0 * culledG.number_of_nodes() / G.number_of_nodes()
+		culledG.graph['numCulledForUsers'] = skein_settings.cullN
+		culledG.graph['numCulledPercentage'] = culledPercentage * 100
+		culledG.graph['numTotalAccounts'] = G.number_of_nodes()
+
+		print "culled Graph to", culledG.number_of_nodes(), "by max posters"
+		print "culled a percentage of:", culledPercentage, "nodes"
+	except Exception as e:
+		print "error in culling:"
+		print e
+
+	return culledG
+
+
+
+
+def toWeightedGraph(M):
+
+	# create weighted graph from M
+	G = nx.Graph()
+	for u,v,data in M.edges_iter(data=True):
+		w = data['weight']
+		if G.has_edge(u,v):
+			G[u][v]['weight'] += w
+		else:
+			G.add_edge(u, v, weight=w)
+
+	return G
+	# [(1, 2, {'weight': 26}), (2, 3, {'weight': 42})]
+
+
+def obfuscateDict(data, is_compressed=False):
+	data["is_obfuscated"] = "true"
+	if(is_compressed):
+		data["is_compressed"] = "true"
+
+	data["linksmap"] = skein_settings.desiredObfPostMaps
+	data["links"] = [returnObfuscatedPost(adj, is_compressed) for adj in data["links"]]
+	data["nodesmap"] = skein_settings.desiredObfPersonMaps
+	data["nodes"] = [returnObfuscatedPerson(node, is_compressed) for node in data["nodes"]]
+	return data
+
+	
+
+def writeDataVizGraphToJson(G, writeFilename, mode="unobfuscated"):
+
+	Gjson = json_graph.node_link_data(G)
+
+	for node in Gjson["nodes"]:
+		node["neighbors"] = [k for k, v in node["neighbors"].iteritems()]
+
+	if(mode == "obfuscated"):
+		Gjson = obfuscateDict(Gjson, is_compressed=True)
+
+	with open(writeFilename, 'w') as outfile:
+		if(mode == "obfuscated"):
+			json.dump(Gjson, outfile, sort_keys = True, separators=(',', ':'))
+		else:
+			json.dump(Gjson, outfile, sort_keys = True, indent=4)
+	print "wrote dataviz graph to json"
+
+	print "Analyzed term '", searchTerm , "' (", searchTermEng, ")"##, "' from file", csvdir + csvFilename, "."
+	print "Printed", G.number_of_nodes() , "nodes and", G.number_of_edges() , "links to <", writeFilename, ">."
+
+
+def writeNetworkXGraphToJson(G, writeFilename):
+
+	Gjson = json_graph.node_link_data(G)
+
+	with open(writeFilename, 'w') as outfile:
+		json.dump(Gjson, outfile, sort_keys = True, indent=4)
+
+	print "Analyzed term '", searchTerm , "' (", searchTermEng, ")"##, "' from file", csvdir + csvFilename, "."
+	print "Printed", G.number_of_nodes() , "nodes and", G.number_of_edges() , "links to <", writeFilename, ">."
+
+
+
+
+def writeGEXF(G, writeFilename):
+	print "GEXF to file", writeFilename
+#	for node,data in G.nodes_iter(data=True):
+#		print node, data
+	try:
+#		from pudb import set_trace; set_trace()
+		nx.write_gexf(G, writeFilename)
+		print "successful GEXF write"
+	except Exception as e:
+		exc_type, exc_obj, exc_tb = sys.exc_info()
+		fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+		print(exc_type, fname, exc_tb.tb_lineno)
+		print "error on GEXF write", e
+
+
+def stringify(tup):
+	tupstr = map(lambda x: str(x), tup)
+	stringified =  "".join(tupstr)
+#	print stringified,
+	return stringified
+
+
+
+def outputVizStatJson(G, sortedPosts, outfile):
+
+	try:
+
+		# this is done becomes if we have large graphs rendered with static images, we definitely don't want to have to laod a huge JSON file just to get these stats.
+
+		sorted_nodes = sorted(map(lambda x: x[1],G.nodes(data=True)), key = lambda k: 0 if 'allref_out_count' not in k else k.get('allref_out_count'), reverse = True)
+
+		"""
+			This visualization depicts ### total accounts
+			which made a total of ### posts containing the term "".
+			Of these, ### posts mentioned or reposted content from another account. 
+
+			The greatest number of posts made by a single account was ###. 
+			The average number of posts per account was ###; the median was ###. 
+			The account with the greatest number of reposts and mentions was linked to ### other accounts. 
+			The average number of connections per account was ###; the median was ###.
+		"""
+
+		vizStats = {}
+
+	#	print G.number_of_nodes()
+		vizStats['numCulledForUsers'] = G.graph['numCulledForUsers']
+		vizStats['numCulledPercentage'] = G.graph['numCulledPercentage']
+		vizStats['numTotalAccounts'] = G.graph['numTotalAccounts']
+		vizStats['numDisplayedAccounts'] = G.number_of_nodes()
+		vizStats['numTotalPosts'] =  len(sortedPosts)
+		userNames = map(lambda x: x[1]['user.screenName'], G.nodes(data=True))
+		vizStats['numDisplayedPosts'] = len(filter(lambda p: p['user.name'] in userNames, sortedPosts))
+		vizStats['numPosts'] =  len(sortedPosts)
+		vizStats['numMentionAccounts'] = len(filter(lambda n: 'in_network' in n, sorted_nodes))
+		vizStats['numUsers'] = G.number_of_nodes()
+
+		vizStats['numRefsByUsers'] = G.number_of_edges()
+
+		vizStats['meanPostsByUser'] = numpy.mean(map(lambda n: n['total_posts'], sorted_nodes))
+		vizStats['medianPostsByUser'] = numpy.median(map(lambda n: n['total_posts'], sorted_nodes))
+
+		vizStats['numOutRefsByMaxPostUser'] = sorted_nodes[0]['allref_out_count']
+		vizStats['meanOutRefsByUser'] = numpy.mean(map(lambda n: n['allref_out_count'], sorted_nodes))
+		vizStats['medianOutRefsByUser'] = numpy.median(map(lambda n: n['allref_out_count'], sorted_nodes))
+
+		#so hacky but it works
+		def getTotRefs(k):
+			kout = 0 if 'allref_out_count' not in k else k.get('allref_out_count')
+			kin = 0 if 'allref_in_count' not in k else k.get('allref_in_count')
+			return kout + kin
+		sorted_nodes_for_tot = sorted(map(lambda x: x[1],G.nodes(data=True)), key = lambda k: getTotRefs(k), reverse = True)
+
+		vizStats['numTotRefsByMaxPostUser'] = sorted_nodes_for_tot[0]['allref_out_count'] + sorted_nodes_for_tot[0]['allref_in_count']
+		vizStats['meanTotRefsByUser'] = numpy.mean(map(lambda n: n['allref_out_count'] + n['allref_in_count'], sorted_nodes))
+		vizStats['medianTotRefsByUser'] = numpy.median(map(lambda n: n['allref_out_count'] + n['allref_in_count'],  sorted_nodes))
+
+		vizStats['numNeighborsByMaxPostUser'] = len(sorted_nodes[0]['neighbors'])
+		vizStats['meanNeighborsByUser'] = numpy.mean(map(lambda n: len(n['neighborIDs']), sorted_nodes))
+		vizStats['medianNeighborsByUser'] = numpy.median(map(lambda n: len(n['neighborIDs']), sorted_nodes))
+
+
+		sorted_nodes_in = sorted(map(lambda x: x[1],G.nodes(data=True)), key = lambda k: 0 if 'allref_in_count' not in k else k.get('allref_in_count'), reverse = True)
+		vizStats['numInRefsByMaxPostUser'] = sorted_nodes_in[0]['allref_in_count']
+
+
+
+		vizStats['G.graph'] = G.graph
+
+		with open(outfile, 'w') as f:
+			json.dump(vizStats, f, sort_keys = True, separators=(',', ':'))
+
+	except Exception as  e:
+		print e
+
+
+def outputStatTexts(G, statfile):
+
+	with open(statfile, 'w') as f:
+
+		f.write(stringify(["Analyzed term '", searchTerm, "' (", searchTermEng, ").\n"]))
+		f.write(stringify(["Printed", G.number_of_nodes() , "nodes and", G.number_of_edges() , "links.\n\n"]))
+
+		f.write(nx.info(G))
+
+		topN = 20
+
+		f.write(stringify(["\nTop", topN, "Users who called out the most ATs (Promoters)\n"]))
+		sorted_nodes = sorted(map(lambda x: x[1],G.nodes(data=True)), key = lambda k: 0 if 'allref_out_count' not in k else k.get('allref_out_count'), reverse = True)
+		for thisdict in sorted_nodes[:topN]:
+			thisdefdict = defaultdict(int)
+			thisdefdict.update(thisdict)
+			f.write(stringify(["Sent", thisdefdict['allref_out_count'], ", Received", thisdefdict['allref_in_count'], ":", thisdefdict["screenName"] , "\n"]))
+
+
+		f.write("\n")
+		f.write(stringify(["Top", topN, "Users who received the most ATs (Populars)\n"]))
+		sorted_nodes = sorted(map(lambda x: x[1],G.nodes(data=True)), key = lambda k: 0 if 'allref_in_count' not in k else k.get('allref_in_count'), reverse = True)
+		for thisdict in sorted_nodes[:topN]:
+			thisdefdict = defaultdict(int)
+			thisdefdict.update(thisdict)
+			f.write(stringify(["Sent", thisdefdict['allref_out_count'], ", Received", thisdefdict['allref_in_count'], ":", thisdefdict["screenName"] , "\n"]))
+			
+		try:
+			f.write(stringify(["Diameter of graph = ", nx.diameter(G), "\n"]))
+		except Exception as  e:
+			exc_type, exc_obj, exc_tb = sys.exc_info()
+			fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+			print(exc_type, fname, exc_tb.tb_lineno)
+			pass
+		try:
+			f.write(stringify(["\nDensity of graph = ", nx.density(G), "\n"]))
+		except:
+			pass
+		try:
+			histo = nx.degree_histogram(G)
+			f.write(stringify(["\nDegree histogram of x = \n"]))
+			for i in xrange(1,len(histo)):
+				graphlen = int(math.ceil(math.log10(histo[i]))) if histo[i]!=0 else 0
+				graphlen = histo[i]
+#				print "{:>4d} USERS WITH {:>3d} CONNECTIONS | {}".format(histo[i],i, "="*graphlen)
+				f.write("{:>4d} USERS WITH {:>3d} CONNECTIONS | {}\n".format(histo[i],i, "="*graphlen))
+		except Exception,e:
+			print e
+			pass
+
+def main():
+
+	csvFilepathSrcList = skein.getFilePaths(csvdir, "*.csv")
+	args = skein.parseArgs()
+
+	if(args.recentn):
+		# if we know we're just parsing recent, then send those along
+		processList = csvFilepathSrcList[:args.recentn]
+	else:
+		processList = csvFilepathSrcList
+
+	for thisCSV in processList:
+
+		csvFilepathSrc = thisCSV
+		csvFilename = os.path.basename(csvFilepathSrc)
+
+		adjHistoryFilename = csvFilename.replace("term", "adjhistory").replace("csv", "json")
+		adjHistoryFilepathDest = jsondir + adjHistoryFilename
+
+		obfuscatedAdjHistoryFilename = csvFilename.replace("term", "obfuscatedAdjhistory").replace("csv", "json")
+		obfuscatedAdjHistoryFilepathDest = jsondir + obfuscatedAdjHistoryFilename
+
+		networkXFilename = csvFilename.replace("term", "adjgraph").replace("csv", "json")
+		networkXFilepathDest = jsondir + networkXFilename
+
+		obfuscatedNetworkXFilename = csvFilename.replace("term", "obfuscatedAdjgraph").replace("csv", "json")
+		obfuscatedNetworkXFilepathDest = jsondir + obfuscatedNetworkXFilename
+
+		gexfFilepathDest = jsondir + csvFilename.replace("term", "adjgexf").replace("csv", "gexf")
+
+		statFilename = csvFilename.replace("term", "adjstats").replace("csv", "txt")
+		statFilepathDest = jsondir + statFilename
+
+		vizstatFilename = csvFilename.replace("term", "vizstats").replace("csv", "json")
+		vizstatFilepathDest = jsondir + vizstatFilename
+
+		(thisSearchTerm, thisSearchTermEng) = skein.parseTermsFromCSV(thisCSV)
+		if(args.term):
+			if(args.term != thisSearchTermEng):
+				continue
+		elif(args.term_chinese):
+			if(args.term_chinese != thisSearchTerm):
+				continue
+		elif(skein.file_len(thisCSV) < 1):
+			print "===== SKIPPING (empty file)", thisCSV
+			continue
+		elif(not (args.recentn) and not (args.overwrite) and os.path.isfile(statFilepathDest)):
+			print "===== SKIPPING", thisCSV
+			continue
+
+		print "     ===== PROCESSING", csvFilepathSrc
+
+		try:
+			initVars(csvFilepathSrc)
+
+			accountDict = generateAccountCategoryDict("../" + skein_settings.MANUAL_ACCOUNT_CATEGORY_FILEPATH)
+
+			print "loading csv into adjacency history"
+			(adjHistory, sortedPosts, screenNameObfIndex) = csvInputToAdjacencyHistory(csvFilepathSrc, accountDict)
+
+			print "generating networkX graph from adjacencies"
+			G = generateNetworkXGraph(adjHistory, sortedPosts, screenNameObfIndex, accountDict)
+
+#			print "write adjacency history to file"
+#			writeAdjHistory(adjHistory, adjHistoryFilepathDest)
+
+#			print "write obfuscated adjacency history to file"
+#			writeObfuscatedAdjHistory(adjHistory, obfuscatedAdjHistoryFilepathDest)
+
+#			print "writing networkX graph to JSON"
+#			writeDataVizGraphToJson(G, networkXFilepathDest, "unobfuscated") 
+
+			print "culling graph to get max X posters"
+			G = cullNetworkXGraph(G)
+
+			print "writing obfuscated networkX graph to JSON"
+			writeDataVizGraphToJson(G, obfuscatedNetworkXFilepathDest, "obfuscated") 
+
+#			print "writing GEXF"
+#			writeGEXF(G, gexfFilepathDest)
+
+
+#			print "displaying stat texts" 
+#			outputStatTexts(G, statFilepathDest)
+
+			print "writing stat json for viz"
+			outputVizStatJson(G, sortedPosts, vizstatFilepathDest)
+			
+			print "     >> ALL DONE"
+
+		except Exception as e:
+			exc_type, exc_obj, exc_tb = sys.exc_info()
+			fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+			print(exc_type, fname, exc_tb.tb_lineno)
+
+
+
+if __name__ == "__main__":
+	main()
+
